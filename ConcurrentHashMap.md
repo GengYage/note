@@ -815,6 +815,7 @@ public boolean containsValue(Object value) {
         // 保证数据一致
         Traverser<K,V> it = new Traverser<K,V>(t, t.length, 0, t.length);
 
+        // 很简单,只需要遍历tab就行,不用考虑hash冲突(有hash冲突就必然有这个value)
         for (Node<K,V> p; (p = it.advance()) != null; ) {
             V v;
             if ((v = p.val) == value || (v != null && value.equals(v)))
@@ -859,48 +860,59 @@ static class Traverser<K,V> {
     final Node<K,V> advance() {
         Node<K,V> e;
         // 第一次调用advance没用,后续调用才有用(类似实现一个简单的迭代器)
+        // 遍历链和数的关键方法(如果是一个链或者树,用这个方法和for循环的第一个判断去遍历这个链或者树)
         if ((e = next) != null)
+            // 更新e
             e = e.next;
 
         // 遍历逻辑
         for (;;) {
             Node<K,V>[] t; int i, n;  // must use locals in checks
 
-            // 返回e
+            // e不是null,换句话 说这条链还没有遍历完
             if (e != null)
-                // 赋值next,方便下次调用advance继续上次的查找
+                // 更新next,并返回e
                 return next = e;
 
-            // 防熊,防止传的参数起始索引就大于初始的tab长度
+            // 1.遍历完成
+            // 2.正在扩容的情况下baseIndex可能大于baseLimit
             if (baseIndex >= baseLimit 
-                // 空表判断
+                // 空表判断,更新t
                 || (t = tab) == null 
-                // 防熊判断
+                // 防熊判断,更新n
                 || (n = t.length) <= (i = index) 
                 // 索引不能小于0
                 || i < 0)
-                // 空表或者异常情况,就会返回null,next也设置成null
+                // 已完成的情况,返回null遍历完成
                 return next = null;
 
             // hash小于0 两种情况
             // 1. 树节点
             // 2. 正在扩容,且当前槽已经扩容完成
             if ((e = tabAt(t, i)) != null && e.hash < 0) {
+                // 正在扩容
                 if (e instanceof ForwardingNode) {
                     // 去遍历nextTable,应为当前槽已经扩容完成了(由于扩容时是不会阻塞添加的,(但是必须将当前槽扩容完),后续的putVal会将新值添加到nextTable的两条新链上,所以正在扩容时,需要这么做)
+                    // 但是就有另一个问题了,nextTable也不是最全的,怎么办?
                     tab = ((ForwardingNode<K,V>)e).nextTable;
-                    // 下次调用advance不要继续从nextTable遍历(因为万一下次就扩容完了呢?)
+                    // 将e设置成null,因为正在扩容是这个槽节点是不存储值的
+                    // 然后走for循环去遍历nextTable
                     e = null;
-                    // 保存扩容状态
+                    // 保存旧tab,当前要遍历的槽,和旧tab的长度
+                    // 这就是上述讲的,正在扩容,两个都不全,怎么办的解决方式
+                    // 注意tab = nextTable不是永久的,遍历一个槽就结束了
                     pushState(t, i, n);
                     continue;
                 }
                 // 树节点,直接查找就好了
                 else if (e instanceof TreeBin)
+                    // 树节点是存储值的,后续跟链一样,通过next去遍历
                     e = ((TreeBin<K,V>)e).first;
+                // 异常情况 todo
                 else
                     e = null;
             }
+
             // 尝试恢复状态
             if (stack != null)
                 recoverState(n);
@@ -915,30 +927,55 @@ static class Traverser<K,V> {
       */
     private void pushState(Node<K,V>[] t, int i, int n) {
         TableStack<K,V> s = spare;  // reuse if possible
+
+        // 如果spare不是null,则直接将spare设置成s.next就好了(原因看recoverState)
+        // 
         if (s != null)
             spare = s.next;
         else
             s = new TableStack<K,V>();
+
+        // 更新s的数据
+        // 旧tab
         s.tab = t;
+        // 就tab长度
         s.length = n;
+        // 索引(槽的下标)
         s.index = i;
+        // 设置next
         s.next = stack;
+        // 赋值 stack
         stack = s;
     }
 
     private void recoverState(int n) {
         TableStack<K,V> s; int len;
+        // 遍历这个栈,直到遍历到栈低
+        // stack不能是null,且旧的tab长度
+        // 索引加上旧tab的长度要大于n(什么时候等于? index=0的时候,遍历的第一个槽就是扩容完的,且扩容还未commit)
         while ((s = stack) != null && (index += (len = s.length)) >= n) {
             n = len;
+            // 恢复index
             index = s.index;
+            // 恢复tab
             tab = s.tab;
+            // 重置TableStack.tab
             s.tab = null;
+
+            // next = null
             TableStack<K,V> next = s.next;
+            // 将s.next设置成spare
             s.next = spare; // save for reuse
+            // 将stack设置成next
             stack = next;
+            // spare设置成s
             spare = s;
         }
+
+        // 如果index=0就不会走到这(因为index=0是还没有遍历旧链,需要去遍历这个链),然后在advance里的下一次循环,会拿到正确的值
+        // index+baseSize大于旧容量,则将index设置成新tab的索引
         if (s == null && (index += baseSize) >= n)
+            // 原理很简单
             index = ++baseIndex;
     }
 }
