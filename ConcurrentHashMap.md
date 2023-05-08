@@ -35,7 +35,7 @@ final V putVal(K key, V value, boolean onlyIfAbsent) {
         }
         // 有hash冲突,且hash 被表集成了MOVED -1
         else if ((fh = f.hash) == MOVED)
-            // 则当前线程,帮助扩容
+            // 则当前线程,帮助扩容,注意tab的赋值,精髓啊!(锁的粒度很细,只要把当前槽扩容完,就可以再新的tab的两条新链添加值了,而不必等扩容commit之后才能添加新值)
             tab = helpTransfer(tab, f);
         // 仅仅是hash冲突,没有扩容
         else {
@@ -686,3 +686,275 @@ private final void transfer(Node<K,V>[] tab, Node<K,V>[] nextTab) {
 }
 ```
 
+### helpTransfer
+
+```java
+final Node<K,V>[] helpTransfer(Node<K,V>[] tab, Node<K,V> f) {
+    Node<K,V>[] nextTab; int sc;
+
+    // 扩容逻辑,必然会对应的槽设置成ForwardingNode
+    // ForwardingNode 携带了nextTable
+    if (tab != null && (f instanceof ForwardingNode) &&
+        (nextTab = ((ForwardingNode<K,V>)f).nextTable) != null) {
+
+        int rs = resizeStamp(tab.length);
+
+        // 确保扩容没有结束
+        while (nextTab == nextTable 
+               && table == tab 
+               // 扩容是sizeCtl小于0
+               && (sc = sizeCtl) < 0) {
+            // 老bug了,直接看openjdk的
+            if ((sc >>> RESIZE_STAMP_SHIFT) != rs || sc == rs + 1 ||
+                sc == rs + MAX_RESIZERS || transferIndex <= 0)
+                break;
+            if (U.compareAndSwapInt(this, SIZECTL, sc, sc + 1)) {
+                transfer(tab, nextTab);
+                break;
+            }
+        }
+        return nextTab;
+    }
+    return table;
+}
+
+// openjdk 版本
+final Node<K,V>[] helpTransfer(Node<K,V>[] tab, Node<K,V> f) {
+    Node<K,V>[] nextTab; int sc;
+    if (tab != null && (f instanceof ForwardingNode) &&
+        (nextTab = ((ForwardingNode<K,V>)f).nextTable) != null) {
+        // 直接左移16位
+        int rs = resizeStamp(tab.length) << RESIZE_STAMP_SHIFT;
+        while (nextTab == nextTable 
+               && table == tab 
+               && (sc = sizeCtl) < 0) {
+            // 确保协助扩容后的线程数未达到最大值,65535个
+            if (sc == rs + MAX_RESIZERS 
+                // 如果扩容已经在commit前的检查阶段也不需要协助扩容
+                || sc == rs + 1
+                // transferIndex <= 0 表示扩容已经结束
+                || transferIndex <= 0)
+                break;
+            // 增加协助扩容线程计数
+            if (U.compareAndSwapInt(this, SIZECTL, sc, sc + 1)) {
+                // 协助扩容
+                transfer(tab, nextTab);
+                break;
+            }
+        }
+        // 只要一个槽扩容完,我就可以去添加了
+        return nextTab;
+    }
+
+    // 无须协助扩容,直接返回tab
+    return table;
+}
+```
+
+### get
+
+```java
+public V get(Object key) {
+    Node<K,V>[] tab; Node<K,V> e, p; int n, eh; K ek;
+    // 计算桶的位置
+    int h = spread(key.hashCode());
+
+    // 赋值tab且保证tab已经被初始化
+    if ((tab = table) != null 
+        // 赋值长度n且确保长度大于0
+        && (n = tab.length) > 0
+        // 赋值e    (n - 1) & h 和hashMap一样,不做解释
+        && (e = tabAt(tab, (n - 1) & h)) != null) {
+
+        // 判断是否有hash冲突,eh的赋值
+        if ((eh = e.hash) == h) {
+            // 如果hahsCode都一样,则比较key (hashCode 一样很常见比如BB和Aa)
+            if ((ek = e.key) == key || (ek != null && key.equals(ek)))
+                return e.val;
+        }
+        // 如果节点hash小于0
+        // 1. 没有在扩容hash为TREEBIN -2,是个TreeNode,TreeNode重写了find方法
+        // 2. 正在扩容hash为MOVED -1,且这个槽扩容完了(但是扩容还未结束),则是个ForwardingNode,也重写了find
+        // 如果还有小于0的就是未定义情况了,当然Node本身也有find方法
+        // 多态最好的体现！
+        else if (eh < 0)
+            return (p = e.find(h, key)) != null ? p.val : null;
+
+        // hash大于0,且有hash冲突,只有一种情况,是个链,遍历链表
+        while ((e = e.next) != null) {
+            if (e.hash == h &&
+                ((ek = e.key) == key || (ek != null && key.equals(ek))))
+                return e.val;
+        }
+
+    }
+
+    // 都没找到就是不存在
+    return null;
+}
+```
+
+
+### containsKey
+
+```java
+public boolean containsKey(Object key) {
+    return get(key) != null;
+}
+```
+
+### containsValue
+
+```java
+public boolean containsValue(Object value) {
+    if (value == null)
+        throw new NullPointerException();
+
+    Node<K,V>[] t;
+    if ((t = table) != null) {
+        // 保证数据一致
+        Traverser<K,V> it = new Traverser<K,V>(t, t.length, 0, t.length);
+
+        for (Node<K,V> p; (p = it.advance()) != null; ) {
+            V v;
+            if ((v = p.val) == value || (v != null && value.equals(v)))
+                return true;
+        }
+    }
+    return false;
+}
+
+
+
+// 保证读数据一致性的关键
+static class Traverser<K,V> {
+    // 成员变量直接看英文注释就行
+    Node<K,V>[] tab;        // current table; updated if resized
+    Node<K,V> next;         // the next entry to use
+    // ForwardingNodes只有在扩容时才会有
+    TableStack<K,V> stack, spare; // to save/restore on ForwardingNodes
+
+    int index;              // index of bin to use next
+    // 初始索引
+    int baseIndex;          // current index of initial table
+    // 初始tab的长度
+    int baseLimit;          // index bound for initial table
+    // tab的初始大小
+    final int baseSize;     // initial table size
+
+    // 构造器 new Traverser<K,V>(t, t.length, 0, t.length)
+    Traverser(Node<K,V>[] tab, int size, int index, int limit) {
+        this.tab = tab;
+        this.baseSize = size;
+        // 赋值索引值
+        this.baseIndex = this.index = index;
+        this.baseLimit = limit;
+        this.next = null;
+    }
+
+    /**
+      * Advances if possible, returning next valid node, or null if none.
+      */
+    // 关键方法,迭代查询
+    final Node<K,V> advance() {
+        Node<K,V> e;
+        // 第一次调用advance没用,后续调用才有用(类似实现一个简单的迭代器)
+        if ((e = next) != null)
+            e = e.next;
+
+        // 遍历逻辑
+        for (;;) {
+            Node<K,V>[] t; int i, n;  // must use locals in checks
+
+            // 返回e
+            if (e != null)
+                // 赋值next,方便下次调用advance继续上次的查找
+                return next = e;
+
+            // 防熊,防止传的参数起始索引就大于初始的tab长度
+            if (baseIndex >= baseLimit 
+                // 空表判断
+                || (t = tab) == null 
+                // 防熊判断
+                || (n = t.length) <= (i = index) 
+                // 索引不能小于0
+                || i < 0)
+                // 空表或者异常情况,就会返回null,next也设置成null
+                return next = null;
+
+            // hash小于0 两种情况
+            // 1. 树节点
+            // 2. 正在扩容,且当前槽已经扩容完成
+            if ((e = tabAt(t, i)) != null && e.hash < 0) {
+                if (e instanceof ForwardingNode) {
+                    // 去遍历nextTable,应为当前槽已经扩容完成了(由于扩容时是不会阻塞添加的,(但是必须将当前槽扩容完),后续的putVal会将新值添加到nextTable的两条新链上,所以正在扩容时,需要这么做)
+                    tab = ((ForwardingNode<K,V>)e).nextTable;
+                    // 下次调用advance不要继续从nextTable遍历(因为万一下次就扩容完了呢?)
+                    e = null;
+                    // 保存扩容状态
+                    pushState(t, i, n);
+                    continue;
+                }
+                // 树节点,直接查找就好了
+                else if (e instanceof TreeBin)
+                    e = ((TreeBin<K,V>)e).first;
+                else
+                    e = null;
+            }
+            // 尝试恢复状态
+            if (stack != null)
+                recoverState(n);
+            // 增加索引喽,设置下次遍历的起始索引
+            else if ((index = i + baseSize) >= n)
+                index = ++baseIndex; // visit upper slots if present
+        }
+    }
+
+    /**
+      * Saves traversal state upon encountering a forwarding node.
+      */
+    private void pushState(Node<K,V>[] t, int i, int n) {
+        TableStack<K,V> s = spare;  // reuse if possible
+        if (s != null)
+            spare = s.next;
+        else
+            s = new TableStack<K,V>();
+        s.tab = t;
+        s.length = n;
+        s.index = i;
+        s.next = stack;
+        stack = s;
+    }
+
+    private void recoverState(int n) {
+        TableStack<K,V> s; int len;
+        while ((s = stack) != null && (index += (len = s.length)) >= n) {
+            n = len;
+            index = s.index;
+            tab = s.tab;
+            s.tab = null;
+            TableStack<K,V> next = s.next;
+            s.next = spare; // save for reuse
+            stack = next;
+            spare = s;
+        }
+        if (s == null && (index += baseSize) >= n)
+            index = ++baseIndex;
+    }
+}
+
+static final class TableStack<K,V> {
+    int length;
+    int index;
+    Node<K,V>[] tab;
+    TableStack<K,V> next;
+}
+```
+
+### contains
+
+```java
+public boolean contains(Object value) {
+    return containsValue(value);
+}
+```
